@@ -1,40 +1,26 @@
-import { useEffect, useState } from 'react'
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
+import AuthProvider from './AuthProvider'
+import RequireAuth from './components/RequireAuth'
+import DashboardPage from './pages/DashboardPage'
+import LoginPage from './pages/LoginPage'
 
-// 백엔드 /api/health 응답 구조 (backend/app/main.py 와 맞춰야 함)
-type HealthResponse = {
-  status: 'ok' | 'error'
-  db: 'ok' | 'unreachable'
-  time: string
-}
-
-type HealthState = HealthResponse & { httpStatus: number }
-
-function App() {
-  const [health, setHealth] = useState<HealthState | null>(null)
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    fetch('/api/health')
-      .then(async (res) => {
-        const data = (await res.json()) as HealthResponse
-        setHealth({ httpStatus: res.status, ...data })
-      })
-      .catch((e: unknown) => {
-        setError(e instanceof Error ? e.message : String(e))
-      })
-  }, [])
-
+export default function App() {
   return (
-    <main style={{ padding: 24, fontFamily: 'sans-serif' }}>
-      <h1>Stock Monitor</h1>
-      {error && <p>API 연결 실패: {error}</p>}
-      {health ? (
-        <pre>{JSON.stringify(health, null, 2)}</pre>
-      ) : (
-        !error && <p>확인 중...</p>
-      )}
-    </main>
+    <BrowserRouter>
+      <AuthProvider>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+          <Route
+            path="/"
+            element={
+              <RequireAuth>
+                <DashboardPage />
+              </RequireAuth>
+            }
+          />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </AuthProvider>
+    </BrowserRouter>
   )
 }
-
-export default App
