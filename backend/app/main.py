@@ -5,7 +5,11 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from  app.db import get_conn
+from app.db import get_conn
+
+from app.auth import router as auth_router
+from app.watchlist import router as watchlist_router
+from app.prices import router as prices_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,3 +39,7 @@ def health():
             status_code=503,
             content={"status": "error", "db": "unreachable", "time": now},
         )
+    
+app.include_router(auth_router)
+app.include_router(watchlist_router)
+app.include_router(prices_router)
