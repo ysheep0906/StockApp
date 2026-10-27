@@ -116,6 +116,44 @@ def kis_check(code: str) -> int:
         print(f"  {key} = {out.get(key)}")
     return 0 if data.get("rt_cd") == "0" else 1
 
+def sync_stocks() -> int:
+    """DART 회사 목록으로 stocks 테이블을 추가·갱신한다 (삭제는 하지 않음)."""
+    from collector.dart import fetch_listed_companies
+
+    with job_run("sync_stocks") as job:
+        companies = fetch_listed_companies()
+
+        # 같은 종목코드가 여러 번 나오면 마지막 것을 쓰고, 몇 건인지 기록
+        by_code: dict[str, dict] = {}
+        duplicated = 0
+        for c in companies:
+            if c["stock_code"] in by_code:
+                duplicated += 1
+            by_code[c["stock_code"]] = c
+
+        now = now_kst()
+        rows = [(c["stock_code"], c["corp_name"], c["corp_code"], now) for c in by_code.values()]
+        with db_cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO stocks (code, name, dart_corp_code, updated_at)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    name = VALUES(name),
+                    dart_corp_code = VALUES(dart_corp_code),
+                    updated_at = VALUES(updated_at)
+                """,
+                rows,
+            )
+
+        job.rows = len(rows)
+        job.message = f"상장회사 {len(companies)}건, 종목코드 중복 {duplicated}건"
+        logger.info(
+            "SYNC_STOCKS_DONE listed=%d upserted=%d duplicated_codes=%d",
+            len(companies), len(rows), duplicated,
+        )
+    return 0
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="python -m collector.run")
@@ -131,6 +169,8 @@ def main() -> int:
     p_kis = sub.add_parser("kis-check", help="KIS 연동 확인 (응답 필드 출력)")
     p_kis.add_argument("code", help="종목코드. 예: 005930")
 
+    sub.add_parser("sync-stocks", help="DART 회사 목록으로 종목 데이터 동기화")
+
     args = parser.parse_args()
     try:
         if args.command == "collect":
@@ -139,6 +179,8 @@ def main() -> int:
             return seed_mock(args.date, args.gap)
         if args.command == "kis-check":
             return kis_check(args.code)
+        if args.command == "sync-stocks":
+            return sync_stocks()
     except Exception:
         logger.exception("작업 중 예상하지 못한 오류")
         return 1

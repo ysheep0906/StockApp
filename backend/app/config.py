@@ -28,3 +28,6 @@ KIS_APP_SECRET = os.environ.get("KIS_APP_SECRET", "")
 # 기본값은 모의투자 도메인. 실전 키는 주문 권한이 있어 이 프로젝트에서는 쓰지 않는다
 KIS_BASE_URL = os.environ.get("KIS_BASE_URL", "https://openapivts.koreainvestment.com:29443")
 KIS_TOKEN_FILE = os.environ.get("KIS_TOKEN_FILE", str(BASE_DIR / "var" / "kis_token.json"))
+
+# DART Open API (40자리 인증키)
+DART_API_KEY = os.environ.get("DART_API_KEY", "")
