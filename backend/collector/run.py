@@ -154,6 +154,163 @@ def sync_stocks() -> int:
         )
     return 0
 
+INSERT_DISCLOSURE = """
+    INSERT INTO disclosures
+        (rcept_no, stock_code, corp_name, report_nm, rcept_dt, collected_at)
+    VALUES (%s, %s, %s, %s, %s, %s)
+    ON DUPLICATE KEY UPDATE rcept_no = rcept_no
+"""
+
+DART_INTERVAL_SEC = 0.3   # 연속 호출 사이 대기 (공용 API에 대한 예의)
+
+
+def collect_disclosures(days: int) -> int:
+    """관심종목의 최근 N일 공시를 수집한다. 기간을 겹쳐 조회하고 접수번호로 중복을 막는다."""
+    from collector.dart import DartError, fetch_disclosures, require_key
+
+    require_key()   # 키 문제면 종목별로 실패하기 전에 바로 중단
+    today = now_kst().date()
+    bgn = today - timedelta(days=days)
+
+    with job_run("collect_disclosures") as job:
+        with db_cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT s.code, s.dart_corp_code
+                FROM watchlist w
+                JOIN stocks s ON s.code = w.stock_code
+                ORDER BY s.code
+                """
+            )
+            targets = cur.fetchall()
+
+        failed: list[str] = []
+        no_corp_code: list[str] = []
+        for i, t in enumerate(targets):
+            if not t["dart_corp_code"]:
+                no_corp_code.append(t["code"])   # DART 고유번호가 없는 종목
+                continue
+            if i > 0:
+                time.sleep(DART_INTERVAL_SEC)
+
+            try:
+                items = fetch_disclosures(t["dart_corp_code"], bgn, today)
+            except DartError as e:
+                logger.warning("DART_FAILED code=%s error=%s", t["code"], e)
+                failed.append(t["code"])
+                continue
+
+            now = now_kst()
+            rows = [
+                (
+                    it["rcept_no"],
+                    t["code"],
+                    it["corp_name"],
+                    it["report_nm"].strip(),
+                    datetime.strptime(it["rcept_dt"], "%Y%m%d").date(),
+                    now,
+                )
+                for it in items
+                if len(it.get("rcept_no", "")) == 14   # 접수번호 형식이 아니면 버림
+            ]
+            if rows:
+                with db_cursor() as cur:
+                    cur.executemany(INSERT_DISCLOSURE, rows)
+                    job.rows += cur.rowcount     # 새로 저장된 건수만 더해짐
+
+            logger.info("DART_FETCHED code=%s found=%d", t["code"], len(items))
+
+        job.ok = not failed
+        job.message = (
+            f"대상 {len(targets)}종목, 실패 {len(failed)} {failed}, "
+            f"고유번호 없음 {len(no_corp_code)} {no_corp_code}"
+        )
+        logger.info(
+            "COLLECT_DISCLOSURES_DONE targets=%d inserted=%d failed=%d no_corp_code=%d",
+            len(targets), job.rows, len(failed), len(no_corp_code),
+        )
+
+    return 1 if failed else 0
+
+SUMMARY_MAX_ATTEMPTS = 3
+
+
+def summarize_disclosures(limit: int) -> int:
+    """요약 대기(pending) 공시를 최신순으로 limit 건 요약한다."""
+    from collector.dart import DartError, fetch_document_text
+    from collector.summarizer import SummaryError, get_summarizer
+
+    summarizer = get_summarizer()
+
+    with job_run("summarize_disclosures") as job:
+        with db_cursor() as cur:
+            cur.execute(
+                """
+                SELECT rcept_no, report_nm, summary_attempts
+                FROM disclosures
+                WHERE summary_status = 'pending'
+                ORDER BY rcept_dt DESC, rcept_no DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            targets = cur.fetchall()
+
+        failed = 0
+        for i, d in enumerate(targets):
+            if i > 0:
+                time.sleep(DART_INTERVAL_SEC)
+            try:
+                text = fetch_document_text(d["rcept_no"], config.SUMMARY_SOURCE_MAX_CHARS)
+                summary = summarizer.summarize(d["report_nm"], text)
+            except (DartError, SummaryError) as e:
+                failed += 1
+                attempts = d["summary_attempts"] + 1
+                # 상한에 도달하면 failed 로 멈춰서, 같은 공시에 비용이 계속 나가는 것을 막는다
+                status = "failed" if attempts >= SUMMARY_MAX_ATTEMPTS else "pending"
+                logger.warning(
+                    "SUMMARY_FAILED rcept_no=%s attempts=%d status=%s error=%s",
+                    d["rcept_no"], attempts, status, e,
+                )
+                with db_cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE disclosures
+                        SET summary_attempts = %s, summary_status = %s, summary_error = %s
+                        WHERE rcept_no = %s
+                        """,
+                        (attempts, status, str(e)[:500], d["rcept_no"]),
+                    )
+                continue
+
+            with db_cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE disclosures
+                    SET summary = %s, summary_status = 'done', summarized_at = %s, summary_error = NULL
+                    WHERE rcept_no = %s
+                    """,
+                    (summary, now_kst(), d["rcept_no"]),
+                )
+            job.rows += 1
+            logger.info("SUMMARY_DONE rcept_no=%s summarizer=%s", d["rcept_no"], summarizer.name)
+
+        job.ok = failed == 0
+        job.message = f"대상 {len(targets)}건, 성공 {job.rows}, 실패 {failed}"
+        logger.info("SUMMARIZE_DONE targets=%d done=%d failed=%d", len(targets), job.rows, failed)
+
+    return 1 if failed else 0
+
+
+def show_document(rcept_no: str) -> int:
+    """확인용: 원문에서 추출한 텍스트의 길이와 앞부분을 출력한다."""
+    from collector.dart import fetch_document_text
+
+    text = fetch_document_text(rcept_no, config.SUMMARY_SOURCE_MAX_CHARS)
+    print(f"추출 길이: {len(text)}자 (상한 {config.SUMMARY_SOURCE_MAX_CHARS})")
+    print(text[:800])
+    return 0
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="python -m collector.run")
@@ -169,6 +326,15 @@ def main() -> int:
     p_kis = sub.add_parser("kis-check", help="KIS 연동 확인 (응답 필드 출력)")
     p_kis.add_argument("code", help="종목코드. 예: 005930")
 
+    p_disc = sub.add_parser("collect-disclosures", help="관심종목 공시 수집")
+    p_disc.add_argument("--days", type=int, default=3, help="오늘부터 며칠 전까지 조회할지 (기본 3)")
+
+    p_sum = sub.add_parser("summarize-disclosures", help="요약 대기 공시를 요약")
+    p_sum.add_argument("--limit", type=int, default=config.SUMMARY_BATCH_LIMIT)
+
+    p_doc = sub.add_parser("show-document", help="(확인용) 공시 원문 추출 결과 출력")
+    p_doc.add_argument("rcept_no")
+
     sub.add_parser("sync-stocks", help="DART 회사 목록으로 종목 데이터 동기화")
 
     args = parser.parse_args()
@@ -181,6 +347,12 @@ def main() -> int:
             return kis_check(args.code)
         if args.command == "sync-stocks":
             return sync_stocks()
+        if args.command == "collect-disclosures":
+            return collect_disclosures(args.days)
+        if args.command == "summarize-disclosures":
+            return summarize_disclosures(args.limit)
+        if args.command == "show-document":
+            return show_document(args.rcept_no)
     except Exception:
         logger.exception("작업 중 예상하지 못한 오류")
         return 1

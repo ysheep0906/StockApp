@@ -31,3 +31,8 @@ KIS_TOKEN_FILE = os.environ.get("KIS_TOKEN_FILE", str(BASE_DIR / "var" / "kis_to
 
 # DART Open API (40자리 인증키)
 DART_API_KEY = os.environ.get("DART_API_KEY", "")
+
+# 공시 요약
+SUMMARIZER = os.environ.get("SUMMARIZER", "mock")   # mock | (D5-3b에서 실제 LLM 추가)
+SUMMARY_SOURCE_MAX_CHARS = int(os.environ.get("SUMMARY_SOURCE_MAX_CHARS", "6000"))  # LLM에 보낼 원문 최대 길이
+SUMMARY_BATCH_LIMIT = int(os.environ.get("SUMMARY_BATCH_LIMIT", "10"))  # 1회 실행당 최대 요약 건수
