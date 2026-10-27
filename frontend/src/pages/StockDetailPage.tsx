@@ -71,6 +71,10 @@ export default function StockDetailPage() {
         {data?.name ?? code} ({code})
       </h1>
 
+      <p>
+        <Link to={`/disclosures?stock=${code}`}>이 종목 공시 보기</Link>
+      </p>
+
       <label>
         날짜 <input type="date" value={day || data?.date || ''} onChange={(e) => setDay(e.target.value)} />
       </label>

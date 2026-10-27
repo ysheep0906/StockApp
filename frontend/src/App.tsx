@@ -6,6 +6,7 @@ import DashboardPage from './pages/DashboardPage'
 import LoginPage from './pages/LoginPage'
 import WatchlistPage from './pages/WatchlistPage'
 import StockDetailPage from './pages/StockDetailPage'
+import DisclosuresPage from './pages/DisclosuresPage'
 
 export default function App() {
   return (
@@ -25,6 +26,7 @@ export default function App() {
             <Route path="/" element={<DashboardPage />} />
             <Route path="/watchlist" element={<WatchlistPage />} />
             <Route path="/stocks/:code" element={<StockDetailPage />} />
+            <Route path="/disclosures" element={<DisclosuresPage />} />
           </Route>
 
           <Route path="*" element={<Navigate to="/" replace />} />

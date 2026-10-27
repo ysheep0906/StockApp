@@ -31,6 +31,9 @@ export default function Layout() {
         <NavLink to="/watchlist" style={linkStyle}>
           관심종목
         </NavLink>
+        <NavLink to="/disclosures" style={linkStyle}>
+          공시
+        </NavLink>
         <span style={{ marginLeft: 'auto' }}>
           {user?.username}{' '}
           <button onClick={() => void handleLogout()}>로그아웃</button>
