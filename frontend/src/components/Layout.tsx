@@ -34,6 +34,9 @@ export default function Layout() {
         <NavLink to="/disclosures" style={linkStyle}>
           공시
         </NavLink>
+        <NavLink to="/ops" style={linkStyle}>
+          운영 현황
+        </NavLink>
         <span style={{ marginLeft: 'auto' }}>
           {user?.username}{' '}
           <button onClick={() => void handleLogout()}>로그아웃</button>
