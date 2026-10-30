@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -9,14 +9,21 @@ import requests
 
 from app import config
 from app.timeutil import now_kst
-from collector.providers import ProviderError, Quote
+from collector.providers import Bar, ProviderError, Quote
+
+
 
 logger = logging.getLogger("stockapp.collector.kis")
 
-TIMEOUT = (3, 5)                       # (연결 대기, 응답 대기) 초
-TOKEN_MARGIN = timedelta(minutes=10)   # 만료 10분 전이면 새로 발급
-TR_INQUIRE_PRICE = "FHKST01010100"     # 국내주식 현재가 조회
-TOKEN_EXPIRED = "EGW00123"             # 기간이 만료된 토큰
+TIMEOUT = (3, 5)
+TOKEN_MARGIN = timedelta(minutes=10)
+TOKEN_EXPIRED = "EGW00123"
+
+PATH_PRICE = "/uapi/domestic-stock/v1/quotations/inquire-price"
+TR_INQUIRE_PRICE = "FHKST01010100"        # 국내주식 현재가
+PATH_MINUTE = "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+TR_MINUTE_CHART = "FHKST03010200"         # 국내주식 당일 분봉 (1회 최대 30건, 당일만)
+MARKET_DIV = "J"                          # KRX 기준 (현재가와 분봉 모두 같은 시장 기준)
 
 
 class KisProvider:
@@ -88,53 +95,86 @@ class KisProvider:
         self._token = None
         self.token_file.unlink(missing_ok=True)
 
-    # ---------- 시세 ----------
+        # ---------- 공통 요청 ----------
 
-    def _request_price(self, code: str) -> dict:
+    def _call(self, path: str, tr_id: str, params: dict) -> dict:
         headers = {
             "content-type": "application/json; charset=utf-8",
             "authorization": f"Bearer {self._get_token()}",
             "appkey": config.KIS_APP_KEY,
             "appsecret": config.KIS_APP_SECRET,
-            "tr_id": TR_INQUIRE_PRICE,
+            "tr_id": tr_id,
             "custtype": "P",
         }
-        params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
         try:
             res = self.session.get(
-                f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price",
-                headers=headers,
-                params=params,
-                timeout=TIMEOUT,
+                f"{self.base_url}{path}", headers=headers, params=params, timeout=TIMEOUT
             )
             # KIS는 오류도 JSON 본문으로 알려주므로 상태 코드와 관계없이 본문을 읽는다
             return res.json()
         except (requests.RequestException, ValueError) as e:
-            raise ProviderError(f"시세 요청 실패: {e}") from e
+            raise ProviderError(f"KIS 요청 실패: {e}") from e
 
-    def get_quote(self, code: str) -> Quote:
-        data = self._request_price(code)
-
+    def _request(self, path: str, tr_id: str, params: dict) -> dict:
+        data = self._call(path, tr_id, params)
         if data.get("msg_cd") == TOKEN_EXPIRED:
-            # 만료된 토큰이면 새로 받아서 딱 1번만 재시도 (무한 재시도 방지)
+            # 만료된 토큰이면 새로 받아서 딱 1번만 재시도
             logger.warning("KIS_TOKEN_EXPIRED 토큰 재발급 후 재시도")
             self._invalidate_token()
-            data = self._request_price(code)
-
+            data = self._call(path, tr_id, params)
         if data.get("rt_cd") != "0":
             raise ProviderError(f"KIS 오류 [{data.get('msg_cd')}] {data.get('msg1')}")
+        return data
 
+    # ---------- 현재가 ----------
+
+    def _price_params(self, code: str) -> dict:
+        return {"FID_COND_MRKT_DIV_CODE": MARKET_DIV, "FID_INPUT_ISCD": code}
+
+    def get_quote(self, code: str) -> Quote:
+        data = self._request(PATH_PRICE, TR_INQUIRE_PRICE, self._price_params(code))
         out = data.get("output") or {}
         try:
             return Quote(
                 code=code,
-                price=int(out["stck_prpr"]),              # 현재가
-                change_rate=Decimal(out["prdy_ctrt"]),    # 전일 대비율(%)
-                volume=int(out["acml_vol"]),              # 누적 거래량
+                price=int(out["stck_prpr"]),
+                change_rate=Decimal(out["prdy_ctrt"]),
+                volume=int(out["acml_vol"]),
             )
         except (KeyError, ValueError, InvalidOperation) as e:
             raise ProviderError(f"응답 형식 오류: {e!r}") from e
 
     def raw_price(self, code: str) -> dict:
-        """확인용: 가공하지 않은 응답을 그대로 돌려준다"""
-        return self._request_price(code)
+        """확인용: 가공하지 않은 현재가 응답"""
+        return self._call(PATH_PRICE, TR_INQUIRE_PRICE, self._price_params(code))
+
+    # ---------- 당일 분봉 ----------
+
+    def _minute_params(self, code: str, end: time) -> dict:
+        return {
+            "FID_ETC_CLS_CODE": "",
+            "FID_COND_MRKT_DIV_CODE": MARKET_DIV,
+            "FID_INPUT_ISCD": code,
+            "FID_INPUT_HOUR_1": end.strftime("%H%M%S"),   # 이 시각부터 과거 방향으로 조회
+            "FID_PW_DATA_INCU_YN": "Y",
+        }
+
+    def get_minute_bars(self, code: str, day: date, end: time) -> list[Bar]:
+        if day != now_kst().date():
+            raise ProviderError("KIS 당일 분봉 API는 당일 데이터만 제공합니다")
+
+        data = self._request(PATH_MINUTE, TR_MINUTE_CHART, self._minute_params(code, end))
+        bars: list[Bar] = []
+        for row in data.get("output2") or []:
+            try:
+                ts = datetime.strptime(row["stck_bsop_date"] + row["stck_cntg_hour"], "%Y%m%d%H%M%S")
+                price = int(row["stck_prpr"])   # 분봉의 종가 자리
+            except (KeyError, ValueError):
+                continue                        # 형식이 이상한 행은 버림
+            if ts.date() == day:                # 다른 날짜의 봉이 섞이지 않게
+                bars.append(Bar(ts.replace(second=0), price))
+        return bars
+
+    def raw_minute_bars(self, code: str, end: time) -> dict:
+        """확인용: 가공하지 않은 분봉 응답"""
+        return self._call(PATH_MINUTE, TR_MINUTE_CHART, self._minute_params(code, end))

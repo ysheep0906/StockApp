@@ -11,6 +11,7 @@ from app.auth import router as auth_router
 from app.watchlist import router as watchlist_router
 from app.prices import router as prices_router
 from app.disclosures import router as disclosures_router
+from app.ops import router as ops_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,3 +46,4 @@ app.include_router(auth_router)
 app.include_router(watchlist_router)
 app.include_router(prices_router)
 app.include_router(disclosures_router)
+app.include_router(ops_router)

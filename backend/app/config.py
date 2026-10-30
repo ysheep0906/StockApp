@@ -36,3 +36,11 @@ DART_API_KEY = os.environ.get("DART_API_KEY", "")
 SUMMARIZER = os.environ.get("SUMMARIZER", "mock")   # mock | (D5-3b에서 실제 LLM 추가)
 SUMMARY_SOURCE_MAX_CHARS = int(os.environ.get("SUMMARY_SOURCE_MAX_CHARS", "6000"))  # LLM에 보낼 원문 최대 길이
 SUMMARY_BATCH_LIMIT = int(os.environ.get("SUMMARY_BATCH_LIMIT", "10"))  # 1회 실행당 최대 요약 건수
+
+# Claude API (SUMMARIZER=claude 일 때만 필요)
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+LLM_MODEL = os.environ.get("LLM_MODEL", "claude-haiku-5-5")
+LLM_EFFORT = os.environ.get("LLM_EFFORT", "low")
+
+# Discord 웹훅 (URL 안에 토큰이 있으므로 비밀값으로 취급)
+DISCORD_ALERT_WEBHOOK_URL = os.environ.get("DISCORD_ALERT_WEBHOOK_URL", "")

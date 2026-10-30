@@ -1,7 +1,7 @@
 import math
 import random
 import zlib
-from datetime import datetime
+from datetime import date, datetime, time, timedelta
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol
@@ -21,11 +21,20 @@ class Quote:
     change_rate: Decimal   # 전일 대비 등락률(%)
     volume: int            # 누적 거래량
 
+@dataclass(frozen=True)
+class Bar:
+    ts: datetime   # 분 단위 시각 (초는 00)
+    price: int     # 그 분의 종가
+
 
 class PriceProvider(Protocol):
     name: str
 
     def get_quote(self, code: str) -> Quote: ...
+
+    def get_minute_bars(self, code: str, day: date, end: time) -> list[Bar]:
+        """day 의 end 시각부터 과거 방향으로 분봉을 최대 30개 돌려준다."""
+        ...
 
 
 class MockProvider:
@@ -51,6 +60,18 @@ class MockProvider:
         price = round(base * (1 + change_rate / 100))
         volume = rnd.randint(10_000, 5_000_000)
         return Quote(code, price, Decimal(str(change_rate)), volume)
+    
+    def get_minute_bars(self, code: str, day: date, end: time) -> list[Bar]:
+        if config.MOCK_FAIL_RATE > 0 and random.random() < config.MOCK_FAIL_RATE:
+            raise ProviderError("mock: 의도적으로 발생시킨 분봉 조회 실패")
+        open_dt = datetime.combine(day, time(9, 0))
+        t = min(datetime.combine(day, end).replace(second=0), datetime.combine(day, time(15, 30)))
+        bars: list[Bar] = []
+        while t >= open_dt and len(bars) < 30:
+            bars.append(Bar(t, self.quote_at(code, t).price))
+            t -= timedelta(minutes=1)
+        return bars
+
 
 
 def get_provider() -> PriceProvider:

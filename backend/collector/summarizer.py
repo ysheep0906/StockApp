@@ -1,4 +1,5 @@
 import random
+import logging
 from typing import Protocol
 
 from app import config
@@ -60,4 +61,49 @@ class MockSummarizer:
 def get_summarizer() -> Summarizer:
     if config.SUMMARIZER == "mock":
         return MockSummarizer()
-    raise ValueError(f"아직 지원하지 않는 SUMMARIZER: {config.SUMMARIZER} (D5-3b에서 추가)")
+    if config.SUMMARIZER == "claude":
+        return ClaudeSummarizer()
+    raise ValueError(f"알 수 없는 SUMMARIZER: {config.SUMMARIZER}")
+
+logger = logging.getLogger("stockapp.collector.summarizer")
+
+class ClaudeSummarizer:
+    name = "claude"
+
+    def __init__(self):
+        if not config.ANTHROPIC_API_KEY:
+            raise ValueError("SUMMARIZER=claude 이면 ANTHROPIC_API_KEY 설정이 필요합니다")
+        import anthropic   # claude 모드에서만 필요하므로 여기서 불러온다
+
+        self._anthropic = anthropic
+        self.client = anthropic.Anthropic(
+            api_key=config.ANTHROPIC_API_KEY,
+            timeout=30.0,     # 응답이 30초 넘게 없으면 실패 처리
+            max_retries=2,    # 일시적 오류(429, 5xx, 연결 오류)는 SDK가 2번까지 재시도
+        )
+
+    def summarize(self, title: str, text: str) -> str:
+        try:
+            res = self.client.messages.create(
+                model=config.LLM_MODEL,
+                max_tokens=600,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": build_user_prompt(title, text)}],
+                output_config={"effort": config.LLM_EFFORT},
+                thinking={"type": "disabled"},
+            )
+        except self._anthropic.APIError as e:
+            status = getattr(e, "status_code", None)
+            raise SummaryError(f"Claude API 오류: {type(e).__name__} status={status}") from e
+
+        # 실제 비용 계산용: 응답마다 사용 토큰을 기록
+        logger.info(
+            "LLM_USAGE model=%s input_tokens=%d output_tokens=%d stop_reason=%s",
+            res.model, res.usage.input_tokens, res.usage.output_tokens, res.stop_reason,
+        )
+        if res.stop_reason == "refusal":
+            raise SummaryError("모델이 요약을 거부함")
+
+        # 응답 본문에서 텍스트 블록만 모은다
+        output = "".join(block.text for block in res.content if block.type == "text")
+        return normalize_summary(output)

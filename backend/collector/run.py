@@ -7,11 +7,10 @@ from app import config
 from app.db import db_cursor
 from app.timeutil import now_kst
 from collector.jobs import job_run
-from app.market import is_trading_time
-from collector.providers import ProviderError, get_provider
+from app.market import MARKET_CLOSE, MARKET_OPEN, is_trading_time
 
 from datetime import date, datetime, time as dtime, timedelta
-from collector.providers import MockProvider
+from collector.providers import Bar, MockProvider, ProviderError, Quote, get_provider
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,6 +25,84 @@ INSERT_PRICE = """
     ON DUPLICATE KEY UPDATE stock_code = stock_code
 """
 
+INSERT_ALERT = """
+    INSERT INTO alert_log
+        (user_id, stock_code, alert_type, trade_date, price, change_rate, sent_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    ON DUPLICATE KEY UPDATE id = id
+"""
+
+
+def run_alerts(ts: datetime, quotes: dict[str, Quote], provider_name: str) -> int:
+    """방금 수집한 시세로 알림 조건을 검사하고 Discord로 보낸다."""
+    if not quotes:
+        return 0
+    from collector.notify import NotifyError, send_discord
+
+    prefix = "[MOCK] " if provider_name == "mock" else ""   # 가짜 시세 알림은 구분 표시
+
+    with job_run("price_alert") as job:
+        with db_cursor() as cur:
+            cur.execute(
+                """
+                SELECT w.user_id, w.stock_code, s.name, w.alert_up_pct, w.alert_down_pct
+                FROM watchlist w
+                JOIN stocks s ON s.code = w.stock_code
+                WHERE w.alert_up_pct IS NOT NULL OR w.alert_down_pct IS NOT NULL
+                """
+            )
+            rows = cur.fetchall()
+
+        sent = failed = skipped = 0
+        for row in rows:
+            q = quotes.get(row["stock_code"])
+            if q is None:
+                continue
+
+            if row["alert_up_pct"] is not None and q.change_rate >= row["alert_up_pct"]:
+                kind, label, arrow, threshold = "up", "상승", "▲", row["alert_up_pct"]
+            elif row["alert_down_pct"] is not None and q.change_rate <= -row["alert_down_pct"]:
+                kind, label, arrow, threshold = "down", "하락", "▼", row["alert_down_pct"]
+            else:
+                continue
+
+            # 1) 먼저 기록(선점): 오늘 이미 보낸 알림이면 여기서 걸러진다
+            with db_cursor() as cur:
+                cur.execute(
+                    INSERT_ALERT,
+                    (row["user_id"], row["stock_code"], kind, ts.date(),
+                     q.price, q.change_rate, now_kst()),
+                )
+                if cur.rowcount != 1:
+                    skipped += 1
+                    continue
+                alert_id = cur.lastrowid
+
+            # 2) 전송
+            message = (
+                f"{prefix}{arrow} [{label} 알림] {row['name']}({row['stock_code']}) "
+                f"{q.change_rate:+.2f}% · 현재가 {q.price:,}원 "
+                f"(기준 {label} {threshold}% · {ts:%H:%M})"
+            )
+            try:
+                send_discord(config.DISCORD_ALERT_WEBHOOK_URL, message)
+            except NotifyError as e:
+                # 3) 실패하면 선점 기록을 지워서 다음 수집 때 다시 시도하게 한다
+                failed += 1
+                logger.warning("ALERT_FAILED code=%s kind=%s error=%s", row["stock_code"], kind, e)
+                with db_cursor() as cur:
+                    cur.execute("DELETE FROM alert_log WHERE id = %s", (alert_id,))
+                continue
+
+            sent += 1
+            logger.info("ALERT_SENT code=%s kind=%s rate=%s", row["stock_code"], kind, q.change_rate)
+
+        job.rows = sent
+        job.ok = failed == 0
+        job.message = f"전송 {sent}, 실패 {failed}, 오늘 이미 보냄 {skipped}"
+
+    return 1 if failed else 0
+
 
 def collect(force: bool) -> int:
     now = now_kst()
@@ -35,13 +112,14 @@ def collect(force: bool) -> int:
 
     ts = now.replace(second=0)   # 수집을 시작한 '분'으로 기록
     provider = get_provider()
+    quotes: dict[str, Quote] = {}
+    failed: list[str] = []
 
     with job_run("collect_price") as job:
         with db_cursor() as cur:
             cur.execute("SELECT DISTINCT stock_code FROM watchlist ORDER BY stock_code")
             codes = [r["stock_code"] for r in cur.fetchall()]
 
-        failed: list[str] = []
         for i, code in enumerate(codes):
             if i > 0:
                 time.sleep(config.REQUEST_INTERVAL_SEC)   # 외부 API 호출 한도 준수
@@ -52,9 +130,10 @@ def collect(force: bool) -> int:
                 failed.append(code)
                 continue   # 한 종목 실패가 전체를 멈추지 않게
 
+            quotes[code] = q
             with db_cursor() as cur:
                 cur.execute(INSERT_PRICE, (code, ts, q.price, q.change_rate, q.volume, now_kst()))
-                job.rows += cur.rowcount   # 새로 들어가면 1, 이미 있으면 0
+                job.rows += cur.rowcount
 
         if failed:
             job.ok = False
@@ -65,7 +144,9 @@ def collect(force: bool) -> int:
             provider.name, ts, len(codes), job.rows, len(failed),
         )
 
-    return 1 if failed else 0
+    # 수집과 알림은 실행 기록을 따로 남긴다 (시세는 저장됐는데 알림만 실패한 경우를 구분)
+    alert_rc = run_alerts(ts, quotes, provider.name)
+    return 1 if failed or alert_rc else 0
 
 def parse_gap(text: str) -> tuple[dtime, dtime]:
     start, end = text.split("-")
@@ -311,6 +392,160 @@ def show_document(rcept_no: str) -> int:
     print(text[:800])
     return 0
 
+INSERT_BACKFILL = """
+    INSERT INTO price_minute
+        (stock_code, ts, price, change_rate, volume, source, collected_at)
+    VALUES (%s, %s, %s, NULL, NULL, 'backfill', %s)
+    ON DUPLICATE KEY UPDATE stock_code = stock_code
+"""
+
+MAX_BACKFILL_CALLS = 14   # 30건 × 14회 = 420분 → 하루(391분)를 넘는 상한
+
+
+def expected_minutes(day: date, until: dtime) -> list[datetime]:
+    """day 의 09:00 부터 until 까지 있어야 할 분 목록"""
+    t = datetime.combine(day, MARKET_OPEN)
+    end = datetime.combine(day, until)
+    result = []
+    while t <= end:
+        result.append(t)
+        t += timedelta(minutes=1)
+    return result
+
+
+def group_ranges(minutes: list[datetime]) -> list[tuple[datetime, datetime, int]]:
+    """정렬된 분 목록을 연속 구간 (시작, 끝, 개수) 으로 묶는다"""
+    ranges: list[tuple[datetime, datetime, int]] = []
+    for m in minutes:
+        if ranges and m - ranges[-1][1] == timedelta(minutes=1):
+            start, _, count = ranges[-1]
+            ranges[-1] = (start, m, count + 1)
+        else:
+            ranges.append((m, m, 1))
+    return ranges
+
+
+def fetch_bars_for_range(provider, code: str, day: date,
+                         gap_start: datetime, gap_end: datetime) -> list[Bar]:
+    """gap_end 부터 과거로 30개씩 거슬러 올라가며 gap_start 까지 분봉을 모은다"""
+    collected: dict[datetime, Bar] = {}   # 페이지 경계에서 겹치는 봉은 dict 로 중복 제거
+    cursor = (gap_end + timedelta(minutes=1)).time()
+    for _ in range(MAX_BACKFILL_CALLS):
+        bars = provider.get_minute_bars(code, day, cursor)
+        time.sleep(config.REQUEST_INTERVAL_SEC)   # 외부 API 호출 한도 준수
+        if not bars:
+            break
+        for b in bars:
+            collected[b.ts] = b
+        oldest = min(b.ts for b in bars)
+        if oldest <= gap_start:
+            break
+        cursor = (oldest - timedelta(minutes=1)).time()
+    return list(collected.values())
+
+
+def backfill(day: date) -> int:
+    """day 의 수집 누락 구간을 찾아 분봉으로 채우고, 결과를 collection_gaps 에 남긴다"""
+    now = now_kst()
+    if day.weekday() >= 5:
+        logger.info("주말이므로 누락 점검을 건너뜀 (day=%s)", day)
+        return 0
+    if day > now.date():
+        logger.error("미래 날짜는 점검할 수 없습니다 (day=%s)", day)
+        return 1
+
+    until = MARKET_CLOSE
+    if day == now.date():
+        if now.time() < dtime(9, 2):
+            logger.info("아직 장 초반이라 점검할 구간이 없음")
+            return 0
+        # 아직 확정되지 않은 최근 2분은 점검하지 않는다
+        until = min(MARKET_CLOSE, (now - timedelta(minutes=2)).time().replace(second=0, microsecond=0))
+
+    provider = get_provider()
+    expected = expected_minutes(day, until)
+    day_start = datetime.combine(day, dtime(0, 0))
+
+    with job_run("backfill") as job:
+        with db_cursor() as cur:
+            cur.execute("SELECT DISTINCT stock_code FROM watchlist ORDER BY stock_code")
+            codes = [r["stock_code"] for r in cur.fetchall()]
+
+        gaps_found = failed_gaps = 0
+        for code in codes:
+            with db_cursor() as cur:
+                cur.execute(
+                    "SELECT ts FROM price_minute WHERE stock_code = %s AND ts >= %s AND ts < %s",
+                    (code, day_start, day_start + timedelta(days=1)),
+                )
+                have = {r["ts"] for r in cur.fetchall()}
+
+            missing = [m for m in expected if m not in have]
+            for gap_start, gap_end, count in group_ranges(missing):
+                gaps_found += 1
+                detected_at = now_kst()
+                try:
+                    bars = fetch_bars_for_range(provider, code, day, gap_start, gap_end)
+                except ProviderError as e:
+                    logger.warning("BACKFILL_FETCH_FAILED code=%s gap=%s~%s error=%s",
+                                   code, gap_start.time(), gap_end.time(), e)
+                    bars = []
+
+                rows = [(code, b.ts, b.price, now_kst()) for b in bars
+                        if gap_start <= b.ts <= gap_end]
+                recovered = 0
+                if rows:
+                    with db_cursor() as cur:
+                        cur.executemany(INSERT_BACKFILL, rows)
+                        recovered = cur.rowcount
+
+                status = "recovered" if recovered >= count else "failed"
+                if status == "failed":
+                    failed_gaps += 1
+                with db_cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO collection_gaps
+                            (stock_code, trade_date, gap_start, gap_end, missing_count,
+                             status, detected_at, recovered_at, recovered_count)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (code, day, gap_start, gap_end, count, status, detected_at,
+                         now_kst() if recovered else None, recovered),
+                    )
+                job.rows += recovered
+                logger.info("GAP code=%s range=%s~%s missing=%d recovered=%d status=%s",
+                            code, gap_start.time(), gap_end.time(), count, recovered, status)
+
+        job.ok = failed_gaps == 0
+        job.message = f"{day} 누락 구간 {gaps_found}개, 복구 실패 {failed_gaps}개, 복구 {job.rows}분"
+        logger.info("BACKFILL_DONE day=%s gaps=%d failed=%d recovered_minutes=%d",
+                    day, gaps_found, failed_gaps, job.rows)
+
+    return 1 if failed_gaps else 0
+
+
+def kis_minute_check(code: str, hhmmss: str) -> int:
+    """KIS 분봉 연동 확인용: 응답 건수와 첫/마지막 행의 핵심 필드를 출력한다"""
+    from collector.kis import KisProvider
+
+    data = KisProvider().raw_minute_bars(code, datetime.strptime(hhmmss, "%H%M%S").time())
+    rows = data.get("output2") or []
+    print(f"rt_cd={data.get('rt_cd')} msg_cd={data.get('msg_cd')} msg1={data.get('msg1')} rows={len(rows)}")
+    for label, row in (("첫 행", rows[0] if rows else {}), ("마지막 행", rows[-1] if rows else {})):
+        print(f"  [{label}] " + " ".join(
+            f"{k}={row.get(k)}" for k in ("stck_bsop_date", "stck_cntg_hour", "stck_prpr", "cntg_vol")))
+    return 0 if data.get("rt_cd") == "0" else 1
+
+def ops_status() -> int:
+    """운영 상태를 JSON으로 출력한다. 전체 정상이면 종료 코드 0, 아니면 1."""
+    import json
+
+    from app.ops import build_ops_status
+
+    status = build_ops_status()
+    print(json.dumps(status, ensure_ascii=False, default=str, indent=2))
+    return 0 if status["overall"] == "ok" else 1
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="python -m collector.run")
@@ -335,7 +570,15 @@ def main() -> int:
     p_doc = sub.add_parser("show-document", help="(확인용) 공시 원문 추출 결과 출력")
     p_doc.add_argument("rcept_no")
 
+    p_back = sub.add_parser("backfill", help="수집 누락 구간 감지 및 분봉으로 재수집")
+    p_back.add_argument("--date", type=date.fromisoformat, default=None, help="기본값: 오늘")
+
+    p_kmin = sub.add_parser("kis-minute-check", help="KIS 당일 분봉 연동 확인")
+    p_kmin.add_argument("code")
+    p_kmin.add_argument("hhmmss", help="기준 시각. 예: 153000")
+
     sub.add_parser("sync-stocks", help="DART 회사 목록으로 종목 데이터 동기화")
+    sub.add_parser("ops-status", help="운영 상태를 JSON으로 출력 (정상이면 종료 코드 0)")
 
     args = parser.parse_args()
     try:
@@ -353,6 +596,12 @@ def main() -> int:
             return summarize_disclosures(args.limit)
         if args.command == "show-document":
             return show_document(args.rcept_no)
+        if args.command == "backfill":
+            return backfill(args.date or now_kst().date())
+        if args.command == "kis-minute-check":
+            return kis_minute_check(args.code, args.hhmmss)
+        if args.command == "ops-status":
+            return ops_status()
     except Exception:
         logger.exception("작업 중 예상하지 못한 오류")
         return 1
