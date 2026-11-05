@@ -44,3 +44,5 @@ LLM_EFFORT = os.environ.get("LLM_EFFORT", "low")
 
 # Discord 웹훅 (URL 안에 토큰이 있으므로 비밀값으로 취급)
 DISCORD_ALERT_WEBHOOK_URL = os.environ.get("DISCORD_ALERT_WEBHOOK_URL", "")
+
+MARKET_HOLIDAYS_FILE = os.environ.get("MARKET_HOLIDAYS_FILE", str(BASE_DIR / "holidays.txt"))

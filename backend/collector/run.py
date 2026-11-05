@@ -7,7 +7,7 @@ from app import config
 from app.db import db_cursor
 from app.timeutil import now_kst
 from collector.jobs import job_run
-from app.market import MARKET_CLOSE, MARKET_OPEN, is_trading_time
+from app.market import MARKET_CLOSE, MARKET_OPEN, is_trading_day, is_trading_time
 
 from datetime import date, datetime, time as dtime, timedelta
 from collector.providers import Bar, MockProvider, ProviderError, Quote, get_provider
@@ -447,8 +447,8 @@ def fetch_bars_for_range(provider, code: str, day: date,
 def backfill(day: date) -> int:
     """day 의 수집 누락 구간을 찾아 분봉으로 채우고, 결과를 collection_gaps 에 남긴다"""
     now = now_kst()
-    if day.weekday() >= 5:
-        logger.info("주말이므로 누락 점검을 건너뜀 (day=%s)", day)
+    if not is_trading_day(day):
+        logger.info("휴장일(주말 포함)이므로 누락 점검을 건너뜀 (day=%s)", day)
         return 0
     if day > now.date():
         logger.error("미래 날짜는 점검할 수 없습니다 (day=%s)", day)

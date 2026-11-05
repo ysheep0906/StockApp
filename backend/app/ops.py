@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends
 
 from app.auth import get_current_user
 from app.db import db_cursor
-from app.market import is_trading_time
+from app.market import is_trading_day, is_trading_time
 from app.timeutil import now_kst
 
 router = APIRouter(tags=["ops"], dependencies=[Depends(get_current_user)])
@@ -20,7 +20,7 @@ def _always(now: datetime) -> bool:
 
 
 def _business_hours(now: datetime) -> bool:
-    return now.weekday() < 5 and time(8, 30) <= now.time() <= time(20, 0)
+    return is_trading_day(now.date()) and time(8, 30) <= now.time() <= time(20, 0)
 
 
 @dataclass(frozen=True)
