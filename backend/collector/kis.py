@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -24,6 +25,9 @@ TR_INQUIRE_PRICE = "FHKST01010100"        # 국내주식 현재가
 PATH_MINUTE = "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
 TR_MINUTE_CHART = "FHKST03010200"         # 국내주식 당일 분봉 (1회 최대 30건, 당일만)
 MARKET_DIV = "J"                          # KRX 기준 (현재가와 분봉 모두 같은 시장 기준)
+
+RATE_LIMITED = "EGW00201"     # 초당 거래건수 초과
+RATE_LIMIT_RETRIES = 2
 
 
 class KisProvider:
@@ -118,10 +122,18 @@ class KisProvider:
     def _request(self, path: str, tr_id: str, params: dict) -> dict:
         data = self._call(path, tr_id, params)
         if data.get("msg_cd") == TOKEN_EXPIRED:
-            # 만료된 토큰이면 새로 받아서 딱 1번만 재시도
             logger.warning("KIS_TOKEN_EXPIRED 토큰 재발급 후 재시도")
             self._invalidate_token()
             data = self._call(path, tr_id, params)
+
+        # 호출 한도 초과: 기다리는 시간을 늘려가며 최대 2번 재시도 (1초, 2초)
+        for attempt in range(1, RATE_LIMIT_RETRIES + 1):
+            if data.get("msg_cd") != RATE_LIMITED:
+                break
+            logger.warning("KIS_RATE_LIMITED tr_id=%s retry=%d", tr_id, attempt)
+            time.sleep(1.0 * attempt)
+            data = self._call(path, tr_id, params)
+
         if data.get("rt_cd") != "0":
             raise ProviderError(f"KIS 오류 [{data.get('msg_cd')}] {data.get('msg1')}")
         return data

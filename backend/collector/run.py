@@ -431,7 +431,14 @@ def fetch_bars_for_range(provider, code: str, day: date,
     collected: dict[datetime, Bar] = {}   # 페이지 경계에서 겹치는 봉은 dict 로 중복 제거
     cursor = (gap_end + timedelta(minutes=1)).time()
     for _ in range(MAX_BACKFILL_CALLS):
-        bars = provider.get_minute_bars(code, day, cursor)
+        try:
+            bars = provider.get_minute_bars(code, day, cursor)
+        except ProviderError:
+            if collected:
+                # 중간에 실패해도 그때까지 받은 분봉은 버리지 않는다
+                logger.warning("BACKFILL_PARTIAL code=%s collected=%d", code, len(collected))
+                break
+            raise
         time.sleep(config.REQUEST_INTERVAL_SEC)   # 외부 API 호출 한도 준수
         if not bars:
             break
